@@ -16,15 +16,14 @@
  *   You should have received a copy of the GNU General Public License
  *   along with lncRNA-Annotation-NF.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-/* 
+ /*
  * Main lncRNA-Annotation-NF pipeline script
  *
  * @authors
  * Sarah Djebali <sarah.djebali-quelen@toulouse.inra.fr>
  * Thomas Derrien <thomas.derrien@univ-rennes1.fr>
  * Paolo Di Tommaso <paolo.ditommaso@gmail.com>
- * Evan Floden <evanfloden@gmail.com> 
+ * Evan Floden <evanfloden@gmail.com>
  */
 
 
@@ -42,7 +41,9 @@ allReads="${params.reads}/*_{1,2}.${params.readsExtension}"
 params.overhang      ='99'
 params.feelnc_opts   = "--biotype transcript_biotype=protein_coding \\ --monoex -1 \\"
 params.output        ="results/"
-
+params.multiqc_config = "$baseDir/multiqc_config.yaml"
+multiqc_config = file(params.multiqc_config)
+params.skip_multiqc = false
 
 log.info "lncRNA Annotation - N F  ~  version 0.1"
 log.info "====================================="
@@ -60,7 +61,7 @@ log.info "\n"
  */
 
 genomeFile             = file(params.genome)
-annotationFile         = file(params.annotation) 
+annotationFile         = file(params.annotation)
 
 FEELnc_filter_options=params.feelnc_opts
 
@@ -73,28 +74,29 @@ FEELnc_filter_options=params.feelnc_opts
 
 
 /*
- * Create a channel for read files 
+ * Create a channel for read files
  */
- 
+
 Channel
     .fromPath( allReads )
     .ifEmpty { error "Cannot find any reads matching: ${params.reads}" }
-    .map { path -> 
+    .map { path ->
        def prefix = readPrefix(path, params.reads)
-       tuple(prefix, path) 
+       tuple(prefix, path)
     }
     .groupTuple(sort: true)
-    .set { read_files } 
+    .set { read_files }
 
 
 process index {
     input:
     file genomeFile
     file annotationFile
-    
+
     output:
     file "STARgenome" into STARgenomeIndex
-    file "genomeLength.txt" into genomeLengths    
+    file "genomeLength.txt" into genomeLengths
+    file "*Log.final.out" into star_results
 
     script:
     //
@@ -123,7 +125,8 @@ process mapping {
     set val(name), file(reads:'*') from read_files
 
     output:
-    set val(name), file("STAR_${name}") into STARmappedReads 
+    set val(name), file("STAR_${name}") into STARmappedReads
+    file "*Log.final.out" into star2_results
 
     script:
     //
@@ -143,14 +146,14 @@ process mapping {
              --outWigType bedGraph \
              --outWigStrand Stranded \
              --outFileNamePrefix ${name}
-        
+
         mkdir STAR_${name}
         mv ${name}Aligned* STAR_${name}/.
         mv ${name}Signal* STAR_${name}/.
         mv ${name}SJ* STAR_${name}/.
         mv ${name}Log* STAR_${name}/.
     """
-   
+
 }
 
 
@@ -191,7 +194,7 @@ process cufflinks_postprocess {
     //
     // Post Process Cufflinks to remove exons exceeding length of chromosome/scaffold
     //
-    """ 
+    """
         cuff=${CUFFLINKS_transcripts}/transcripts.gtf
 
         awk -v fileRef=${genomeLength} 'BEGIN{while (getline < fileRef >0){lg[\$2]=\$1}} \
@@ -249,17 +252,17 @@ process FEELnc_filter{
     //
     // FEELnc Filter Step
     //
- 
+
 
     """
         mkdir FEELnc_filter
- 
+
         FEELnc_filter.pl --infile ${cuffmergeDir}/merged.gtf \
                          --mRNAfile ${annotationFile} \
                          ${FEELnc_filter_options} \
                          --proc ${task.cpus} \
                          > FEELnc_filter/merged_filtered.gtf
-    
+
     """
 
 }
@@ -291,7 +294,7 @@ process FEELnc_codpot{
                           --spethres=0.99,0.99 \
                           --proc=${task.cpus} \
                           --keeptmp
-                          
+
     """
 
 }
@@ -318,22 +321,48 @@ process FEELnc_classifier {
 
 }
 
+process multiqc {
+    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+
+    container 'maxulysse/multiqc:1.0'
+
+    when:
+    !params.skip_multiqc
+
+    input:
+    file multiqc_config
+    file ('star/star*') from star_results.collect().ifEmpty([])
+    file ('star2/star*') from star2_results.collect().ifEmpty([])
+
+    output:
+    file "*multiqc_report.html" into multiqc_report
+    file "*_data"
+
+    script:
+    rtitle = "--title \"lifebit-ai/lncRNA-Annotation-nf\""
+    rfilename = "--filename " + "_multiqc_report"
+    """
+    multiqc . -f $rtitle $rfilename --config $multiqc_config \\
+        -m custom_content -m star
+    """
+}
+
 
 // ===================== UTILITY FUNCTIONS ============================
 
 
-/* 
- * Helper function, given a file Path 
+/*
+ * Helper function, given a file Path
  * returns the file name region matching a specified glob pattern
  * starting from the beginning of the name up to last matching group.
- * 
- * For example: 
+ *
+ * For example:
  *   readPrefix('/some/data/file_alpha_1.fa', 'file*_1.fa' )
- * 
- * Returns: 
+ *
+ * Returns:
  *   'file_alpha'
  */
- 
+
 def readPrefix( Path actual, template ) {
 
     final fileName = actual.getFileName().toString()
@@ -341,9 +370,9 @@ def readPrefix( Path actual, template ) {
     def filePattern = template.toString()
     int p = filePattern.lastIndexOf('/')
     if( p != -1 ) filePattern = filePattern.substring(p+1)
-    if( !filePattern.contains('*') && !filePattern.contains('?') ) 
-        filePattern = '*' + filePattern 
-  
+    if( !filePattern.contains('*') && !filePattern.contains('?') )
+        filePattern = '*' + filePattern
+
     def regex = filePattern
                     .replace('.','\\.')
                     .replace('*','(.*)')
@@ -353,16 +382,14 @@ def readPrefix( Path actual, template ) {
                     .replace(',','|')
 
     def matcher = (fileName =~ /$regex/)
-    if( matcher.matches() ) {  
-        def end = matcher.end(matcher.groupCount() )      
+    if( matcher.matches() ) {
+        def end = matcher.end(matcher.groupCount() )
         def prefix = fileName.substring(0,end)
-        while(prefix.endsWith('-') || prefix.endsWith('_') || prefix.endsWith('.') ) 
+        while(prefix.endsWith('-') || prefix.endsWith('_') || prefix.endsWith('.') )
           prefix=prefix[0..-2]
-          
+
         return prefix
     }
-    
+
     return fileName
 }
-
-
